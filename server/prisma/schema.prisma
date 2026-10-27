@@ -1,0 +1,396 @@
+// Prisma schema — BuildSite (Construction Material Request & Inventory)
+// PostgreSQL. Enums enforce the role matrix and moderation states at DB level.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ──────────────────────────── Enums ────────────────────────────
+
+enum Role {
+  WORKER // Site supervisor / labor
+  CLIENT // Project owner
+  ADMIN // Store manager
+  STAFF // Ops coordinator — photo moderation gatekeeper
+  ACCOUNTS // Finance manager (read-only on stock)
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  PENDING_VERIFICATION
+}
+
+enum MaterialCriticality {
+  LOW
+  MEDIUM
+  HIGH // HIGH always bypasses admin delegation → client queue
+}
+
+enum RequestStatus {
+  DRAFT
+  PENDING_ADMIN_APPROVAL
+  PENDING_CLIENT_APPROVAL
+  APPROVED
+  REJECTED
+  PARTIALLY_ISSUED
+  FULLY_ISSUED
+  CANCELLED
+}
+
+enum ApprovalDecision {
+  APPROVED
+  REJECTED
+}
+
+enum PhotoSubjectType {
+  MATERIAL_REQUEST
+  WORK_PROGRESS
+  INSPECTION
+  DELIVERY_PROOF
+}
+
+enum ModerationStatus {
+  PENDING_REVIEW // visible only to uploader + STAFF
+  APPROVED // visible to project stakeholders; push fan-out
+  REJECTED // visible to uploader (with reason) + STAFF; archived after 7 days
+  FLAGGED_FOR_ESCALATION // held for senior staff review
+  ARCHIVED
+}
+
+enum NotificationType {
+  ACTION_REQUIRED // needs the user to act (approve/moderate)
+  INFO
+  ALERT
+  FINANCIAL_COMMITMENT
+  HIGH_VALUE_ALERT
+}
+
+enum StockMovementType {
+  PURCHASE_IN
+  ISSUE_OUT
+  RETURN_IN
+  ADJUSTMENT
+  VERIFICATION_CORRECTION
+}
+
+enum AuditAction {
+  LOGIN
+  LOGOUT
+  REFRESH_ROTATED
+  REQUEST_CREATED
+  REQUEST_ROUTED
+  REQUEST_APPROVED
+  REQUEST_REJECTED
+  STOCK_ISSUED
+  STOCK_ADJUSTED
+  PHOTO_UPLOADED
+  PHOTO_APPROVED
+  PHOTO_REJECTED
+  PHOTO_FLAGGED
+  USER_MANAGED
+  PROJECT_ASSIGNED
+}
+
+// ──────────────────────────── Identity & Auth ────────────────────────────
+
+model User {
+  id               String     @id @default(uuid())
+  phone            String     @unique
+  email            String?    @unique
+  fullName         String
+  role             Role
+  status           UserStatus @default(ACTIVE)
+  passwordHash     String? // optional: email+password path; mobile uses OTP
+  isPhoneVerified  Boolean    @default(false)
+  biometricEnabled Boolean    @default(false) // device-level flag mirrored for UX only
+  avatarPhotoId    String?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  otpCodes         OtpCode[]
+  refreshTokens    RefreshToken[]
+  projectMemberships ProjectMember[]
+  materialRequests MaterialRequest[]   @relation("Requester")
+  approvals        ApprovalRecord[]    @relation("Approver")
+  uploadPhotos     WorkPhoto[]         @relation("Uploader")
+  moderatedPhotos  WorkPhoto[]         @relation("Moderator")
+  issuedStock      StockMovement[]     @relation("IssuedBy")
+  auditLogs        AuditLog[]
+  notifications    NotificationDevice[]
+
+  @@index([role, status])
+}
+
+model OtpCode {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash   String // bcrypt hash of 6-digit code — plaintext never stored
+  channel    String    @default("SMS")
+  expiresAt  DateTime // now + 5 min
+  attempts   Int       @default(0) // max 3 verifies, then invalidated
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId, expiresAt])
+}
+
+model RefreshToken {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique // SHA-256 of opaque refresh token
+  deviceInfo String? // platform, app version
+  revokedAt  DateTime?
+  lastUsedAt DateTime  @default(now())
+  expiresAt  DateTime // rotation window (7d); idle force-logout enforced client-side + server freshness claim
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// ──────────────────────────── Projects & Membership ────────────────────────────
+
+model Project {
+  id                  String   @id @default(uuid())
+  name                String
+  siteAddress         String
+  code                String   @unique // e.g. "BS-2026-014"
+  // Smart Approval Engine inputs (server-side truth):
+  adminDelegatedLimit Decimal  @db.Decimal(12, 2) // per-project cap admin may approve alone
+  delegatedUsedAmount Decimal  @default(0) @db.Decimal(12, 2) // committed spend via admin-approved requests
+  currency            String   @default("USD")
+  isActive            Boolean  @default(true)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  members          ProjectMember[]
+  materialRequests MaterialRequest[]
+  stockMovements   StockMovement[]
+  photos           WorkPhoto[]
+
+  @@index([isActive])
+}
+
+model ProjectMember {
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  addedAt   DateTime @default(now())
+
+  @@id([projectId, userId])
+}
+
+// ──────────────────────────── Inventory ────────────────────────────
+
+model Material {
+  id            String              @id @default(uuid())
+  sku           String              @unique
+  name          String
+  unit          String // "bag", "m3", "kg", "liter"
+  unitPrice     Decimal             @db.Decimal(12, 2) // server-authoritative pricing
+  criticality   MaterialCriticality @default(MEDIUM)
+  reorderPoint  Int                 @default(0)
+  currentStock  Int                 @default(0) // guarded by serializable transactions + movement ledger
+  reservedStock Int                 @default(0)
+  photoAssetId  String?
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  lineItems MaterialRequestLine[]
+  movements StockMovement[]
+
+  @@index([criticality])
+  @@index([sku])
+}
+
+model StockMovement {
+  id           String            @id @default(uuid())
+  materialId   String
+  material     Material          @relation(fields: [materialId], references: [id])
+  projectId    String?
+  project      Project?          @relation(fields: [projectId], references: [id])
+  type         StockMovementType
+  quantity     Int // signed: negative for OUT
+  unitCost     Decimal           @db.Decimal(12, 2)
+  balanceAfter Int // snapshot for auditability
+  requestId    String?
+  request      MaterialRequest?  @relation(fields: [requestId], references: [id])
+  issuedById   String
+  issuedBy     User              @relation("IssuedBy", fields: [issuedById], references: [id])
+  note         String?
+  createdAt    DateTime          @default(now())
+
+  @@index([materialId, createdAt])
+}
+
+// ──────────────────────────── Material Requests (core workflow) ────────────────────────────
+
+model MaterialRequest {
+  id              String        @id @default(uuid())
+  reference       String        @unique // generated server-side: REQ-YYMMDD-XXXX
+  version         Int           @default(1) // optimistic concurrency token — clients echo via If-Match
+  projectId       String
+  project         Project       @relation(fields: [projectId], references: [id])
+  requesterId     String
+  requester       User          @relation("Requester", fields: [requesterId], references: [id])
+  status          RequestStatus @default(DRAFT)
+  estimatedCost   Decimal       @db.Decimal(12, 2) // computed server-side from catalog prices
+  routedTo        RequestStatus? // engine decision — immutable after routing
+  routingReason   String? // explainable trace: "cost 4,200 > remaining limit 1,800"
+  needsHighValue  Boolean       @default(false)
+  justification   String
+  needByDate      DateTime
+  idempotencyKey  String?       @unique // offline queue replay safety
+  approvedAt      DateTime?
+  rejectedAt      DateTime?
+  cancelledAt     DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  lines     MaterialRequestLine[]
+  approvals ApprovalRecord[]
+  photos    WorkPhoto[]
+  movements StockMovement[]
+
+  @@index([projectId, status])
+  @@index([requesterId, status])
+}
+
+model MaterialRequestLine {
+  id                String          @id @default(uuid())
+  requestId         String
+  request           MaterialRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  materialId        String
+  material          Material        @relation(fields: [materialId], references: [id])
+  quantity          Int
+  unitPriceSnapshot Decimal         @db.Decimal(12, 2) // price locked at submit time (server value)
+  lineTotal         Decimal         @db.Decimal(12, 2) // qty * snapshot, recomputed server-side
+  issuedQuantity    Int             @default(0)
+
+  @@index([requestId])
+}
+
+model ApprovalRecord {
+  id              String           @id @default(uuid())
+  requestId       String
+  request         MaterialRequest  @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  approverId      String
+  approver        User             @relation("Approver", fields: [approverId], references: [id])
+  decision        ApprovalDecision
+  comment         String? // required for REJECTED (DTO-enforced)
+  amountCommitted Decimal          @db.Decimal(12, 2) @default(0) // debits Project.delegatedUsedAmount when admin approves
+  createdAt       DateTime         @default(now())
+
+  @@index([requestId])
+}
+
+// ──────────────────────────── Photo Moderation ────────────────────────────
+
+model WorkPhoto {
+  id               String           @id @default(uuid())
+  subjectType      PhotoSubjectType
+  requestId        String?
+  request          MaterialRequest? @relation(fields: [requestId], references: [id])
+  projectId        String
+  project          Project          @relation(fields: [projectId], references: [id])
+  uploaderId       String
+  uploader         User             @relation("Uploader", fields: [uploaderId], references: [id])
+  s3Key            String           @unique // server-generated key; client never chooses it
+  thumbnailKey     String?
+  mimeType         String
+  byteSize         Int
+  widthPx          Int?
+  heightPx         Int?
+  sha256           String // integrity check on completion callback
+  moderationStatus ModerationStatus @default(PENDING_REVIEW)
+  rejectionReason  String? // shown to uploader when REJECTED
+  reviewedById     String?
+  reviewedBy       User?            @relation("Moderator", fields: [reviewedById], references: [id])
+  reviewedAt       DateTime?
+  scheduledArchiveAt DateTime? // set when REJECTED: now + 7 days; cron purges S3 object + row
+  takenAt          DateTime // EXIF capture time from device
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  @@index([moderationStatus, createdAt]) // moderation queue scan
+  @@index([projectId, moderationStatus]) // stakeholder gallery
+  @@index([uploaderId])
+}
+
+// ──────────────────────────── Notifications & Audit ────────────────────────────
+
+model NotificationDevice {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fcmToken  String   @unique
+  platform  String // ios | android
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+enum OutboxStatus {
+  PENDING
+  DISPATCHED
+  FAILED
+}
+
+/**
+ * Transactional Outbox (suggestion #4): business transactions enqueue rows
+ * here atomically; a Cron dispatcher drains them to FCM with retries.
+ * Guarantees at-least-once notification without dual-write skew.
+ */
+model NotificationOutbox {
+  id          String            @id @default(uuid())
+  recipientId String
+  type        NotificationType
+  title       String
+  body        String
+  dataJson    Json // deep link payload: { screen: "requests/[id]", id }
+  status      OutboxStatus      @default(PENDING)
+  attempts    Int               @default(0)
+  lastError   String?
+  dispatchedAt DateTime?
+  createdAt   DateTime          @default(now())
+
+  @@index([status, createdAt]) // dispatcher scan
+}
+
+model OutboundNotification {
+  id          String           @id @default(uuid())
+  recipientId String
+  type        NotificationType
+  title       String
+  body        String
+  dataJson    Json // deep link payload: { screen: "requests/[id]", id }
+  readAt      DateTime?
+  deliveredAt DateTime?
+  attempts    Int              @default(0)
+  createdAt   DateTime         @default(now())
+
+  @@index([recipientId, readAt])
+}
+
+model AuditLog {
+  id         String      @id @default(uuid())
+  actorId    String?
+  actor      User?       @relation(fields: [actorId], references: [id])
+  action     AuditAction
+  entityType String
+  entityId   String
+  metadata   Json? // before/after snapshots, IP, device
+  createdAt  DateTime    @default(now())
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+}
