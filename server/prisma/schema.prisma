@@ -236,6 +236,7 @@ model StockMovement {
 model MaterialRequest {
   id              String        @id @default(uuid())
   reference       String        @unique // generated server-side: REQ-YYMMDD-XXXX
+  version         Int           @default(1) // optimistic concurrency token — clients echo via If-Match
   projectId       String
   project         Project       @relation(fields: [projectId], references: [id])
   requesterId     String
@@ -336,6 +337,33 @@ model NotificationDevice {
   createdAt DateTime @default(now())
 
   @@index([userId])
+}
+
+enum OutboxStatus {
+  PENDING
+  DISPATCHED
+  FAILED
+}
+
+/**
+ * Transactional Outbox (suggestion #4): business transactions enqueue rows
+ * here atomically; a Cron dispatcher drains them to FCM with retries.
+ * Guarantees at-least-once notification without dual-write skew.
+ */
+model NotificationOutbox {
+  id          String            @id @default(uuid())
+  recipientId String
+  type        NotificationType
+  title       String
+  body        String
+  dataJson    Json // deep link payload: { screen: "requests/[id]", id }
+  status      OutboxStatus      @default(PENDING)
+  attempts    Int               @default(0)
+  lastError   String?
+  dispatchedAt DateTime?
+  createdAt   DateTime          @default(now())
+
+  @@index([status, createdAt]) // dispatcher scan
 }
 
 model OutboundNotification {
